@@ -5,12 +5,29 @@ import time
 import logging
 import os
 import struct
-import zlib
 import random
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("WS-Client")
+
+# Ogg 标准 CRC32 表 (非反转多项式 0x04C11DB7)
+_OGG_CRC_TABLE = [0] * 256
+for i in range(256):
+    r = i << 24
+    for _ in range(8):
+        if r & 0x80000000:
+            r = (r << 1) ^ 0x04c11db7
+        else:
+            r <<= 1
+    _OGG_CRC_TABLE[i] = r & 0xffffffff
+
+def ogg_crc32(data):
+    """计算 Ogg 页面所需的 CRC32 校验码"""
+    crc = 0
+    for b in data:
+        crc = ((crc << 8) ^ _OGG_CRC_TABLE[((crc >> 24) ^ b) & 0xff]) & 0xffffffff
+    return crc
 
 class WebSocketClient:
     def __init__(self, hostname, port, path, device_id, client_id):
@@ -19,18 +36,17 @@ class WebSocketClient:
         self.client_id = client_id
         self.send_queue = None
         self.is_running = True
-        self.session_id = None
         self.is_listening = False
         self.is_playing_tts = False
         self.opus_file_path = "output.opus"
         
-        # 文件路径
+        # 文件保存路径
         self.tts_raw_path = "received_tts.opus"
         self.tts_ogg_path = "received_tts_playable.ogg"
         self.raw_file = None
         self.ogg_file = None
         
-        # Ogg 状态
+        # Ogg 封装状态
         self.ogg_serial = random.randint(0, 0xFFFFFFFF)
         self.ogg_page_num = 0
         self.ogg_granule_pos = 0
@@ -55,6 +71,7 @@ class WebSocketClient:
                     
                     if await self.perform_handshake(websocket):
                         logger.info(f"握手成功！会话 ID: {self.session_id}")
+                        # 运行处理协程
                         await asyncio.gather(
                             self.send_handler(websocket),
                             self.recv_handler(websocket),
@@ -63,11 +80,18 @@ class WebSocketClient:
                     else:
                         logger.error("握手验证失败，准备重连...")
                         
+            except websockets.exceptions.ConnectionClosed:
+                logger.warning("服务器主动断开了连接")
+                break # 根据需求，可以是 break 或继续 retry
             except Exception as e:
-                logger.error(f"连接或运行异常: {e}。将在 {retry_delay}秒后重试...")
+                if not self.is_running: break
+                logger.error(f"连接异常: {e}。将在 {retry_delay}秒后重试...")
                 self._close_files()
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 60)
+        
+        self._close_files()
+        logger.info("WebSocket 客户端已完全停止。")
 
     async def perform_handshake(self, websocket):
         hello_msg = {
@@ -94,6 +118,7 @@ class WebSocketClient:
             return False
 
     async def interaction_logic(self):
+        """控制交互流程"""
         await asyncio.sleep(0.1)
         await self.start_listening()
         await self.audio_producer()
@@ -106,38 +131,45 @@ class WebSocketClient:
             "state": "start",
             "mode": "auto"
         }
+        logger.info(f"发送指令: {json.dumps(listen_msg)}")
         await self.send_queue.put(json.dumps(listen_msg))
         self.is_listening = True
 
+    def close_audio_channel(self):
+        """主动断开连接，回到空闲状态"""
+        logger.info("正在主动关闭音频通道并断开连接...")
+        self.is_running = False
+        self.is_listening = False
+        # 如果有正在进行的发送任务，可以在这里清理
+
     async def send_handler(self, websocket):
         try:
-            while True:
+            while self.is_running:
                 data = await self.send_queue.get()
                 await websocket.send(data)
                 self.send_queue.task_done()
         except Exception as e:
-            logger.error(f"发送异常: {e}")
+            if self.is_running:
+                logger.error(f"发送异常: {e}")
 
     async def recv_handler(self, websocket):
         try:
             async for message in websocket:
+                if not self.is_running: break
                 if isinstance(message, str):
                     data = json.loads(message)
                     logger.info(f"收到 JSON: {data}")
                     self.dispatch_command(data)
                 else:
                     if self.is_playing_tts:
-                        if self.raw_file:
-                            self.raw_file.write(message)
+                        if self.raw_file: self.raw_file.write(message)
                         if self.ogg_file:
-                            # 24000Hz 下，每帧通常是 20ms, 40ms 或 60ms
-                            # 如果服务端返回 60ms，则 granule 增加 24000 * 0.06 = 1440
-                            # 但 Ogg Opus 规范要求 granule 总是基于 48000Hz 计数
-                            self.ogg_granule_pos += 2880 # 60ms at 48k
+                            self.ogg_granule_pos += 2880 # 60ms @ 48kHz
                             page = self._create_ogg_page([message])
                             self.ogg_file.write(page)
         except Exception as e:
-            logger.error(f"接收异常: {e}")
+            if self.is_running:
+                logger.error(f"接收异常: {e}")
 
     def _create_ogg_page(self, packets, header_type=0):
         segment_table = b""
@@ -151,13 +183,16 @@ class WebSocketClient:
             payload += p
         
         # 4sBBQIIIB: Magic, Ver(0), Type, Granule, Serial, Seq, CRC(0), Segments
+        # Header 长度固定 27 字节
         header = bytearray(struct.pack("<4sBBQIIIB", 
             b"OggS", 0, header_type, self.ogg_granule_pos,
             self.ogg_serial, self.ogg_page_num, 0, len(segment_table)
         ))
         self.ogg_page_num += 1
         page = header + segment_table + payload
-        crc = zlib.crc32(page) & 0xffffffff
+        
+        # 使用 Ogg 标准 CRC32 填充
+        crc = ogg_crc32(page)
         struct.pack_into("<I", page, 22, crc)
         return page
 
@@ -168,25 +203,17 @@ class WebSocketClient:
             self.ogg_page_num = 0
             self.ogg_granule_pos = 0
             
-            # 1. OpusHead (必须正好 19 字节)
-            # Format: 8s (Magic), B (Ver), B (Channels), H (Pre-skip), I (Rate), H (Gain), B (Mapping)
-            opus_head = struct.pack("<8sBBHIHB", 
-                b"OpusHead", 
-                1,               # version
-                1,               # channels
-                0,               # pre-skip
-                sample_rate, 
-                0,               # output gain
-                0                # mapping family
+            # OpusHead (19字节)
+            # Format: 8s(Magic), B(Ver), B(Chan), H(PreSkip), I(Rate), h(Gain), B(Map)
+            opus_head = struct.pack("<8sBBHIhB", 
+                b"OpusHead", 1, 1, 0, sample_rate, 0, 0
             )
-            # BOS 页面标志为 0x02
             self.ogg_file.write(self._create_ogg_page([opus_head], header_type=0x02))
             
-            # 2. OpusTags
+            # OpusTags
             vendor = b"Gemini-Client"
             opus_tags = b"OpusTags" + struct.pack("<I", len(vendor)) + vendor + struct.pack("<I", 0)
             self.ogg_file.write(self._create_ogg_page([opus_tags]))
-            
         except Exception as e:
             logger.error(f"初始化文件失败: {e}")
 
@@ -197,7 +224,7 @@ class WebSocketClient:
         if self.ogg_file:
             self.ogg_file.close()
             self.ogg_file = None
-            logger.info(f"TTS 已保存: {self.tts_raw_path} 和 {self.tts_ogg_path}")
+            logger.info(f"TTS 已保存为: {self.tts_raw_path} 和 {self.tts_ogg_path}")
 
     async def audio_producer(self):
         if not os.path.exists(self.opus_file_path): return
@@ -219,9 +246,11 @@ class WebSocketClient:
                                 await asyncio.sleep(0.06)
                             packet_data = b""
                 self.is_listening = False
-                await self.send_queue.put(json.dumps({"session_id": str(self.session_id), "type": "listen", "state": "stop"}))
+                if self.is_running:
+                    await self.send_queue.put(json.dumps({"session_id": str(self.session_id), "type": "listen", "state": "stop"}))
         except Exception as e:
-            logger.error(f"发送音频异常: {e}")
+            if self.is_running:
+                logger.error(f"音频发送异常: {e}")
 
     def dispatch_command(self, data):
         msg_type = data.get("type")
@@ -236,6 +265,9 @@ class WebSocketClient:
             elif state == "stop":
                 self.is_playing_tts = False
                 self._close_files()
+                # 交互完成，根据文档要求，设备可以调用 CloseAudioChannel 断开连接
+                # 这里为了演示，执行断开逻辑
+                # self.close_audio_channel() 
         elif msg_type == "stt":
             logger.info(f"[ASR]: {data.get('text')}")
         elif msg_type == "llm":
@@ -246,10 +278,11 @@ class WebSocketClient:
 
 if __name__ == "__main__":
     client = WebSocketClient(
-        hostname="api.tenclass.net",
-        port=443,
-        path="/xiaozhi/v1/",
-        device_id="00:11:22:33:44:55",
-        client_id="uuid-1234-5678-90ab"
+        hostname="api.tenclass.net", port=443, path="/xiaozhi/v1/",
+        device_id="00:11:22:33:44:55", client_id="uuid-1234-5678-90ab"
     )
-    asyncio.run(client.start())
+    try:
+        asyncio.run(client.start())
+    except KeyboardInterrupt:
+        client.close_audio_channel()
+        logger.info("客户端正在关闭...")
