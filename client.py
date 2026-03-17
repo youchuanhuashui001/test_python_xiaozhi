@@ -6,10 +6,19 @@ import logging
 import os
 import struct
 import random
+import inspect
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("WS-Client")
+
+DEFAULT_OTA_URL = "https://api.tenclass.net/xiaozhi/ota/"
+DEFAULT_APP_VERSION = "1.6.0"
+DEFAULT_STATE_FILE = Path("client_state.json")
 
 # Ogg 标准 CRC32 表 (非反转多项式 0x04C11DB7)
 _OGG_CRC_TABLE = [0] * 256
@@ -29,16 +38,47 @@ def ogg_crc32(data):
         crc = ((crc << 8) ^ _OGG_CRC_TABLE[((crc >> 24) ^ b) & 0xff]) & 0xffffffff
     return crc
 
+
+def is_valid_uuid(value):
+    if not value:
+        return False
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
 class WebSocketClient:
-    def __init__(self, hostname, port, path, device_id, client_id):
+    def __init__(
+        self,
+        hostname,
+        port,
+        path,
+        device_id,
+        client_id=None,
+        ota_url=DEFAULT_OTA_URL,
+        ws_token="test-token",
+        state_file_path=DEFAULT_STATE_FILE,
+        app_version=DEFAULT_APP_VERSION,
+        board_type="python-client",
+    ):
         self.uri = f"wss://{hostname}:{port}{path}"
         self.device_id = device_id
-        self.client_id = client_id
+        self.ota_url = ota_url
+        self.ws_token = ws_token
+        self.state_file_path = Path(state_file_path)
+        self.app_version = app_version
+        self.board_type = board_type
+        self.client_id = self._resolve_client_id(client_id)
         self.send_queue = None
         self.is_running = True
         self.is_listening = False
         self.is_playing_tts = False
         self.opus_file_path = "output.opus"
+        self.session_id = None
+        self.activation_code = None
+        self.activation_message = None
+        self.activation_challenge = None
         
         # 文件保存路径
         self.tts_raw_path = "received_tts.opus"
@@ -51,16 +91,154 @@ class WebSocketClient:
         self.ogg_page_num = 0
         self.ogg_granule_pos = 0
 
-    async def connect(self):
+    def _load_state(self):
+        if not self.state_file_path.exists():
+            return {}
+        try:
+            return json.loads(self.state_file_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"读取状态文件失败，将重新生成 client_id: {e}")
+            return {}
+
+    def _save_state(self, state):
+        self.state_file_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file_path.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _resolve_client_id(self, requested_client_id):
+        state = self._load_state()
+        client_id = requested_client_id
+        if not is_valid_uuid(client_id):
+            if requested_client_id:
+                logger.warning("提供的 client_id 不是合法 UUID，将改用持久化 client_id。")
+            client_id = state.get("client_id")
+
+        if not is_valid_uuid(client_id):
+            client_id = str(uuid.uuid4())
+
+        state["client_id"] = client_id
+        self._save_state(state)
+        return client_id
+
+    def _build_ota_payload(self):
+        return {
+            "application": {
+                "name": "xiaozhi",
+                "version": self.app_version,
+            },
+            "mac_address": self.device_id,
+            "board": {
+                "type": self.board_type,
+            },
+        }
+
+    def _fetch_ota_config(self):
+        request = urllib.request.Request(
+            self.ota_url,
+            data=json.dumps(self._build_ota_payload()).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Device-Id": self.device_id,
+                "Client-Id": self.client_id,
+                "User-Agent": f"xiaozhi/{self.app_version}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                payload = response.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OTA 请求失败: HTTP {e.code} {detail}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"OTA 请求失败: {e.reason}") from e
+
+        return json.loads(payload)
+
+    async def _run_blocking(self, func):
+        to_thread = getattr(asyncio, "to_thread", None)
+        if callable(to_thread):
+            return await to_thread(func)
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, func)
+
+    def _apply_bootstrap_response(self, response):
+        if not isinstance(response, dict):
+            logger.error("OTA 返回了无效响应。")
+            return False
+
+        error_message = response.get("error")
+        if error_message:
+            logger.error(f"OTA 返回错误: {error_message}")
+            return False
+
+        activation = response.get("activation")
+        if isinstance(activation, dict):
+            self.activation_code = activation.get("code")
+            self.activation_message = activation.get("message")
+            self.activation_challenge = activation.get("challenge")
+            logger.info("设备尚未激活，请先完成绑定。")
+            if self.activation_code:
+                logger.info(f"激活码: {self.activation_code}")
+            if self.activation_message:
+                logger.info(f"激活提示:\n{self.activation_message}")
+            logger.info("请使用上面的激活码完成设备绑定，然后重新运行客户端。")
+            return False
+
+        websocket_config = response.get("websocket") or {}
+        websocket_url = websocket_config.get("url")
+        if not websocket_url:
+            logger.error("OTA 返回中缺少 websocket.url，无法继续连接。")
+            return False
+
+        self.uri = websocket_url
+        self.ws_token = websocket_config.get("token", self.ws_token)
+
+        firmware = response.get("firmware") or {}
+        firmware_version = firmware.get("version")
+        if firmware_version:
+            logger.info(f"OTA 固件版本: {firmware_version}")
+
+        return True
+
+    async def bootstrap(self, ota_fetcher=None):
+        self.activation_code = None
+        self.activation_message = None
+        self.activation_challenge = None
+
+        try:
+            if ota_fetcher is None:
+                response = await self._run_blocking(self._fetch_ota_config)
+            else:
+                response = ota_fetcher()
+                if inspect.isawaitable(response):
+                    response = await response
+        except Exception as e:
+            logger.error(f"OTA 引导失败: {e}")
+            return False
+
+        return self._apply_bootstrap_response(response)
+
+    async def connect(self, ota_fetcher=None):
+        if not await self.bootstrap(ota_fetcher=ota_fetcher):
+            return False
+
         if self.send_queue is None:
             self.send_queue = asyncio.Queue()
-        
+
         headers = {
-            "Authorization": "Bearer test-token",
             "Protocol-Version": "1",
             "Device-Id": self.device_id,
             "Client-Id": self.client_id
         }
+        if self.ws_token:
+            auth_value = self.ws_token
+            if " " not in auth_value:
+                auth_value = f"Bearer {auth_value}"
+            headers["Authorization"] = auth_value
 
         retry_delay = 2
         while self.is_running:
@@ -92,6 +270,7 @@ class WebSocketClient:
         
         self._close_files()
         logger.info("WebSocket 客户端已完全停止。")
+        return True
 
     async def perform_handshake(self, websocket):
         hello_msg = {
@@ -279,7 +458,7 @@ class WebSocketClient:
 if __name__ == "__main__":
     client = WebSocketClient(
         hostname="api.tenclass.net", port=443, path="/xiaozhi/v1/",
-        device_id="00:11:22:33:44:55", client_id="uuid-1234-5678-90ab"
+        device_id="d8:bb:c1:dc:02:d4", client_id=None
     )
     try:
         asyncio.run(client.start())
